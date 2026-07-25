@@ -1221,11 +1221,16 @@ InterpFromCoarseLevel (Array<MF*, AMREX_SPACEDIM> const& mf, IntVect const& ngho
         BoxArray ba_crse_idxed = amrex::convert(ba_crse_patch, typ);
 
 #ifdef AMREX_USE_EB
-        auto crse_factory = makeEBFabFactory(cgeom, ba_crse_idxed, dm, {0,0,0}, EBSupport::basic);
-        mf_crse_patch[d].define(ba_crse_idxed, dm, ncomp, 0, MFInfo(), *crse_factory);
-#else
-        mf_crse_patch[d].define(ba_crse_idxed, dm, ncomp, 0);
+        EB2::IndexSpace const* index_space = EB2::TopIndexSpaceIfPresent();
+        if (index_space) {
+            auto crse_factory = makeEBFabFactory(index_space, cgeom, ba_crse_idxed, dm,
+                                                 {0,0,0}, EBSupport::basic);
+            mf_crse_patch[d].define(ba_crse_idxed, dm, ncomp, 0, MFInfo(), *crse_factory);
+        } else
 #endif
+        {
+            mf_crse_patch[d].define(ba_crse_idxed, dm, ncomp, 0);
+        }
         detail::mf_set_domain_bndry(mf_crse_patch[d], cgeom);
 
         mf_crse_patch[d].ParallelCopy(*(cmf[d]), scomp, 0, ncomp, cgeom.periodicity());
