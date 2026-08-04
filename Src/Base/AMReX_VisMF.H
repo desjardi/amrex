@@ -8,6 +8,7 @@
 #include <AMReX_FabArray.H>
 #include <AMReX_FArrayBox.H>
 #include <AMReX_FabConv.H>
+#include <AMReX_FPC.H>
 #include <AMReX_NFiles.H>
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_VisMFBuffer.H>
@@ -378,17 +379,120 @@ std::ostream& operator<< (std::ostream& os, const VisMF::Header& hd);
 //! Read a VisMF::Header from an istream.
 std::istream& operator>> (std::istream& is, VisMF::Header& hd);
 
+/// \cond DOXYGEN_IGNORE
+namespace detail {
+
 /**
- * \brief Write `iMultiFab/FabArray<IArrayBox>`
+ * \brief FAB I/O plumbing for the generic Write/Read below.
  *
- *  This writes an `iMultiFab/FabArray<IArrayBox>` to files on disk, including
+ * The generic functions need four things from the FAB type: the number of
+ * bytes one value occupies on disk, a name for the FabArray header, a per-FAB
+ * header writer, and a per-FAB reader.  FArrayBox and IArrayBox carry those as
+ * static members, and the primary template simply forwards to them.
+ * BaseFab<float> does not, deliberately: AMReX_BaseFab.H is included nearly
+ * everywhere and has no business pulling in FABio.  The dispatch therefore
+ * lives here, in the I/O layer, where the specialization below can build the
+ * float case out of what FPC and RealDescriptor already provide.
+ */
+template <typename FAB>
+struct FabIO
+{
+    static int num_bytes () { return FAB::getDataDescriptor()->numBytes(); }
+    static std::string class_name () { return FAB::getClassName(); }
+    static void write_header (std::ostream& os, FAB const& fab, int nvar)
+        { FAB::getFABio().write_header(os, fab, nvar); }
+    static void read (std::istream& is, FAB& fab) { fab.readFrom(is); }
+};
+
+/**
+ * \brief FAB I/O for `fMultiFab`'s FAB type.
+ *
+ * Write below emits the FAB data as raw native bytes, so the descriptor in the
+ * FAB header is the native binary32 one and no conversion happens on the way
+ * out.  The header itself is byte for byte what FABio_binary writes for an
+ * FArrayBox, so an fMultiFab data file is an ordinary AMReX FAB file that
+ * happens to hold floats.
+ */
+template <>
+struct FabIO<BaseFab<float> >
+{
+    static int num_bytes () { return FPC::Native32RealDescriptor().numBytes(); }
+    static std::string class_name () { return std::string("amrex::BaseFab<float>"); }
+
+    static void write_header (std::ostream& os, BaseFab<float> const& fab, int nvar)
+    {
+        AMREX_ASSERT(nvar <= fab.nComp());
+        os << "FAB " << FPC::Native32RealDescriptor();
+        os << fab.box() << ' ' << nvar << '\n';
+    }
+
+    static void read (std::istream& is, BaseFab<float>& fab)
+    {
+        // The "new" FAB header, which is the only kind write_header emits.
+        char c;
+        is >> c;
+        if (c != 'F') { amrex::Error("FabIO<BaseFab<float>>::read: expected 'F'"); }
+        is >> c;
+        if (c != 'A') { amrex::Error("FabIO<BaseFab<float>>::read: expected 'A'"); }
+        is >> c;
+        if (c != 'B') { amrex::Error("FabIO<BaseFab<float>>::read: expected 'B'"); }
+
+        RealDescriptor rd;
+        Box bx;
+        int nvar;
+        is >> rd >> bx >> nvar;
+        if (fab.box() != bx || fab.nComp() != nvar) { fab.resize(bx,nvar); }
+        is.ignore(99999, '\n');
+
+#ifdef AMREX_USE_GPU
+        if (fab.arena()->isManaged() || fab.arena()->isDevice()) {
+            BaseFab<float> hostfab(fab.box(), fab.nComp(), The_Pinned_Arena());
+            RealDescriptor::convertToNativeFloatFormat(hostfab.dataPtr(), hostfab.size(),
+                                                       is, rd);
+            Gpu::htod_memcpy_async(fab.dataPtr(), hostfab.dataPtr(),
+                                   hostfab.size()*sizeof(float));
+            Gpu::streamSynchronize();
+        } else
+#endif
+        {
+            RealDescriptor::convertToNativeFloatFormat(fab.dataPtr(), fab.size(), is, rd);
+        }
+
+        if (is.fail()) { amrex::Error("FabIO<BaseFab<float>>::read failed"); }
+    }
+};
+
+/**
+ * \brief The FAB types the generic Write/Read below accept, opted in one by
+ * one rather than detected, so that the answer cannot depend on which headers
+ * a translation unit happens to have included.
+ *
+ * FArrayBox is deliberately absent even though FabIO above handles it: the
+ * generic functions do work for MultiFab, but MultiFab keeps going through
+ * VisMF::Write/VisMF::Read to avoid confusion.
+ */
+template <typename FAB> inline constexpr bool has_fab_io = false;
+template <> inline constexpr bool has_fab_io<IArrayBox> = true;
+template <> inline constexpr bool has_fab_io<BaseFab<float> > = true;
+
+}
+/// \endcond
+
+//! Constrains the generic Write/Read below to the FAB types that have FAB I/O.
+template <typename FAB>
+concept HasFabIO = detail::has_fab_io<FAB>;
+
+/**
+ * \brief Write `iMultiFab/FabArray<IArrayBox>` or `fMultiFab/FabArray<BaseFab<float>>`
+ *
+ *  This writes an `iMultiFab`/`fMultiFab` to files on disk, including
  *  a clear text file NAME_H and binary files NAME_D_00000 etc.
  *
- * \param fa is the iMultiFab to be written.
+ * \param fa is the iMultiFab/fMultiFab to be written.
  * \param name is the base name for the files.
  */
 template <typename FAB>
-requires (std::same_as<FAB,IArrayBox>)
+requires (HasFabIO<FAB>)
 // This function does work for MultiFab, but let's disable it to avoid confusion.
 void
 Write (const FabArray<FAB>& fa, const std::string& name)
@@ -396,8 +500,7 @@ Write (const FabArray<FAB>& fa, const std::string& name)
     BL_PROFILE("Write(FabArray)");
     AMREX_ASSERT(!name.empty() && name.back() != '/');
 
-    auto data_descriptor = FAB::getDataDescriptor();
-    int data_bytes = data_descriptor->numBytes();
+    int data_bytes = detail::FabIO<FAB>::num_bytes();
 
     bool useSparseFPP = false;
     const Vector<int> &pmap = fa.DistributionMap().ProcessorMap();
@@ -424,14 +527,12 @@ Write (const FabArray<FAB>& fa, const std::string& name)
         nfi.SetDynamic();
     }
 
-    const auto &fio = FAB::getFABio();
-
     for ( ; nfi.ReadyToWrite(); ++nfi) {
         for(MFIter mfi(fa); mfi.isValid(); ++mfi) {
             const FAB &fab = fa[mfi];
             {
                 std::stringstream hss;
-                fio.write_header(hss, fab, fab.nComp());
+                detail::FabIO<FAB>::write_header(hss, fab, fab.nComp());
                 auto const tstr = hss.view();
                 nfi.Stream().write(tstr.data(), static_cast<std::streamsize>(tstr.size()));
                 nfi.Stream().flush();
@@ -469,7 +570,7 @@ Write (const FabArray<FAB>& fa, const std::string& name)
             amrex::FileOpenFailed(header_file_name);
         }
 
-        ofs << "amrex::FabArray<" << FAB::getClassName() << "> v1.0\n";
+        ofs << "amrex::FabArray<" << detail::FabIO<FAB>::class_name() << "> v1.0\n";
         ofs << fa.nComp() << '\n';
         ofs << fa.nGrowVect() << '\n';
         fa.boxArray().writeOn(ofs);
@@ -485,7 +586,7 @@ Write (const FabArray<FAB>& fa, const std::string& name)
         for (int i = 0; i < nfabs; ++i) {
             std::stringstream hss;
             FAB tmp(fa.fabbox(i), fa.nComp(), false);
-            fio.write_header(hss, tmp, tmp.nComp());
+            detail::FabIO<FAB>::write_header(hss, tmp, tmp.nComp());
             // Size includes header and data
             fabBytes[i] = static_cast<std::streamoff>(hss.tellp()) + tmp.size() * data_bytes;
             rankBoxOrder[dm[i]].push_back(i);
@@ -544,15 +645,15 @@ void read_fab (FAB& fab, VisMF::FabOnDisk const& fod, std::string const& name)
         amrex::FileOpenFailed(fullname);
     }
     ifs.seekg(fod.m_head, std::ios::beg);
-    fab.readFrom(ifs);
+    FabIO<FAB>::read(ifs, fab);
 }
 }
 /// \endcond
 
 /**
- * \brief Read `iMultiFab/FabArray<IArrayBox>`
+ * \brief Read `iMultiFab/FabArray<IArrayBox>` or `fMultiFab/FabArray<BaseFab<float>>`
  *
- * This reads an `iMultiFab/FabArray<IArrayBox>` from disk.  If it has been
+ * This reads an `iMultiFab/fMultiFab` from disk.  If it has been
  * fully defined, the BoxArray on the disk must match the BoxArray in the
  * given `iMultiFab/FabArray<IArrayBox>` object.  If it is only constructed
  * with the default constructor, the BoxArray on the disk will be used and a
@@ -567,7 +668,7 @@ void read_fab (FAB& fab, VisMF::FabOnDisk const& fod, std::string const& name)
  * \param name is the base name for the files.
  */
 template <typename FAB>
-requires (std::same_as<FAB,IArrayBox>)
+requires (HasFabIO<FAB>)
 // This function does work for MultiFab, but let's disable it to avoid confusion.
 void
 Read (FabArray<FAB>& fa, const std::string& name)
@@ -589,7 +690,8 @@ Read (FabArray<FAB>& fa, const std::string& name)
         std::string type, version;
         ifs >> type >> version;
         AMREX_ASSERT(type == "amrex::FabArray<amrex::IArrayBox>" ||
-                     type == "amrex::FabArray<amrex::FArrayBox>");
+                     type == "amrex::FabArray<amrex::FArrayBox>" ||
+                     type == "amrex::FabArray<"+detail::FabIO<FAB>::class_name()+">");
         ifs >> ncomp;
         ifs >> ngrow;
         ba.readFrom(ifs);
