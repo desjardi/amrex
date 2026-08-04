@@ -2358,7 +2358,17 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
     const int nprocs = ParallelDescriptor::NProcs();
     const int io_proc = nprocs - 1;
 
-    RealDescriptor const& whichRD = FPC::NativeRealDescriptor();
+    // The offset table below is built from the GLOBAL FABio's header
+    // string and from whichRD's element size, so BOTH must be the format
+    // the payload is actually written in (fabio, below). Pinning either
+    // one to native while fab.format says otherwise (NATIVE_32 for
+    // single-precision plotfiles) makes every recorded offset disagree
+    // with the bytes on disk by the per-fab header-length difference,
+    // and the file cannot be read back
+    // getDataDescriptor() returns a unique_ptr BY VALUE: hold it, or the
+    // reference dangles the moment the full expression ends
+    auto const whichRD_owner = FArrayBox::getDataDescriptor();
+    RealDescriptor const& whichRD = *whichRD_owner;
 
     auto hdr = std::make_shared<VisMF::Header>(mf, VisMF::NFiles, VisMF::Header::Version_v1, false);
     if (valid_cells_only) { hdr->m_ngrow = IntVect(0); }
@@ -2468,7 +2478,7 @@ VisMF::AsyncWriteDoit (const FabArray<FArrayBox>& mf, const std::string& mf_name
         }
     }
 
-    std::shared_ptr<FABio> fabio(new FABio_binary(FPC::NativeRealDescriptor().clone()));
+    std::shared_ptr<FABio> fabio(new FABio_binary(FArrayBox::getDataDescriptor()->clone()));
 
     AsyncOut::Submit([=] ()
     {
