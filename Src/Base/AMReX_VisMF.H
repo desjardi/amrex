@@ -462,25 +462,29 @@ struct FabIO<BaseFab<float> >
     }
 };
 
+}
+/// \endcond
+
 /**
- * \brief The FAB types the generic Write/Read below accept, opted in one by
- * one rather than detected, so that the answer cannot depend on which headers
- * a translation unit happens to have included.
+ * \brief Constrains the generic Write/Read below to the FAB types that have
+ * FAB I/O.
+ *
+ * The accepted types are spelled out HERE, in the concept itself, rather than
+ * delegated to a variable template: a variable template is an open extension
+ * point that any translation unit can add a specialization to, which would
+ * silently re-route a type to these functions (and, if another TU already
+ * instantiated it, be ill-formed with no diagnostic required). A concept
+ * cannot be explicitly specialized, so this list is closed by construction —
+ * adding a type is an edit here plus a FabIO specialization above, both
+ * visible in one place.
  *
  * FArrayBox is deliberately absent even though FabIO above handles it: the
  * generic functions do work for MultiFab, but MultiFab keeps going through
  * VisMF::Write/VisMF::Read to avoid confusion.
  */
-template <typename FAB> inline constexpr bool has_fab_io = false;
-template <> inline constexpr bool has_fab_io<IArrayBox> = true;
-template <> inline constexpr bool has_fab_io<BaseFab<float> > = true;
-
-}
-/// \endcond
-
-//! Constrains the generic Write/Read below to the FAB types that have FAB I/O.
 template <typename FAB>
-concept HasFabIO = detail::has_fab_io<FAB>;
+concept HasFabIO = std::same_as<FAB,IArrayBox>
+                || std::same_as<FAB,BaseFab<float> >;
 
 /**
  * \brief Write `iMultiFab/FabArray<IArrayBox>` or `fMultiFab/FabArray<BaseFab<float>>`
