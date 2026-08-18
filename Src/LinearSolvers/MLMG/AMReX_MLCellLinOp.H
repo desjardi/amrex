@@ -508,6 +508,14 @@ private:
     int m_interpbndry_halfwidth = 2;
 
     mutable Vector<Vector<TagVector<MLMGABCTag<RT>>>> m_bc_tags;
+
+    // Batched setBndryValues tags for the updateSolBC/updateCorBC route.  Each
+    // entry holds Array4s into m_bndry_{sol,cor}[amrlev] and the matching
+    // m_crse_{sol,cor}_br[amrlev]; defineBC() rebuilds all four together.
+    // m_sol_bc_tags follows m_bndry_sol through the precond-mode swap.
+    mutable Vector<TagVector<IBDTag<RT>>> m_sol_bc_tags;
+    mutable Vector<TagVector<IBDTag<RT>>> m_sol_bc_tags_zero;
+    mutable Vector<TagVector<IBDTag<RT>>> m_cor_bc_tags;
 };
 
 /// \cond DOXYGEN_IGNORE
@@ -736,6 +744,15 @@ MLCellLinOpT<MF>::defineBC ()
     m_bndry_cor.resize(this->m_num_amr_levels);
     m_crse_cor_br.resize(this->m_num_amr_levels);
 
+    // Each tag vector mirrors the bndry vector it describes, in size and in
+    // lifetime, so beginPrecondBC's swap keeps every cache with its object.
+    m_sol_bc_tags.clear();
+    m_sol_bc_tags.resize(m_bndry_sol.size());
+    m_sol_bc_tags_zero.clear();
+    m_sol_bc_tags_zero.resize(m_bndry_sol_zero.size());
+    m_cor_bc_tags.clear();
+    m_cor_bc_tags.resize(m_bndry_cor.size());
+
     m_robin_bcval.resize(this->m_num_amr_levels);
 
     for (int amrlev = 0; amrlev < this->m_num_amr_levels; ++amrlev)
@@ -956,6 +973,7 @@ MLCellLinOpT<MF>::updateSolBC (int amrlev, const MF& crse_bcdata) const
                                     this->m_geom[amrlev-1][0].periodicity());
     m_bndry_sol[amrlev]->updateBndryValues(*m_crse_sol_br[amrlev], 0, 0, ncomp,
                                            this->AMRRefRatioVect(amrlev-1),
+                                           m_sol_bc_tags[amrlev],
                                            InterpBndryDataT<MF>::IBD_max_order_DEF,
                                            m_interpbndry_halfwidth);
 }
@@ -971,6 +989,7 @@ MLCellLinOpT<MF>::updateCorBC (int amrlev, const MF& crse_bcdata) const
                                     this->m_geom[amrlev-1][0].periodicity());
     m_bndry_cor[amrlev]->updateBndryValues(*m_crse_cor_br[amrlev], 0, 0, ncomp,
                                            this->AMRRefRatioVect(amrlev-1),
+                                           m_cor_bc_tags[amrlev],
                                            InterpBndryDataT<MF>::IBD_max_order_DEF,
                                            m_interpbndry_halfwidth);
 }
@@ -2525,7 +2544,10 @@ MLCellLinOpT<MF>::beginPrecondBC ()
                  ncomp,
                  this->m_geom[amrlev][0]);
         }
+        m_sol_bc_tags_zero.clear();
+        m_sol_bc_tags_zero.resize(m_bndry_sol_zero.size());
         std::swap(m_bndry_sol, m_bndry_sol_zero);
+        std::swap(m_sol_bc_tags, m_sol_bc_tags_zero);
         MF const* coarse_data_for_bc_save = this->m_coarse_data_for_bc;
         this->m_coarse_data_for_bc = nullptr;
         for (int amrlev = 0; amrlev < this->m_num_amr_levels; ++amrlev) {
@@ -2534,6 +2556,7 @@ MLCellLinOpT<MF>::beginPrecondBC ()
         this->m_coarse_data_for_bc = coarse_data_for_bc_save;
     } else {
         std::swap(m_bndry_sol, m_bndry_sol_zero);
+        std::swap(m_sol_bc_tags, m_sol_bc_tags_zero);
     }
 }
 
@@ -2543,6 +2566,7 @@ MLCellLinOpT<MF>::endPrecondBC ()
 {
     this->m_precond_mode = false;
     std::swap(m_bndry_sol, m_bndry_sol_zero);
+    std::swap(m_sol_bc_tags, m_sol_bc_tags_zero);
 }
 
 extern template class MLCellLinOpT<MultiFab>;

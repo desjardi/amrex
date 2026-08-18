@@ -6,6 +6,7 @@
 #include <AMReX_BCRec.H>
 #include <AMReX_BndryData.H>
 #include <AMReX_InterpBndryData_K.H>
+#include <AMReX_TagParallelFor.H>
 
 /**
  * \file AMReX_InterpBndryData.H
@@ -13,6 +14,25 @@
  */
 
 namespace amrex {
+
+/**
+ * \brief One coarse/fine boundary strip for the batched InterpBndryData path.
+ *
+ * Carries only what varies per (box, face); the interpolation order, ratio and
+ * component offsets are uniform over a call and are passed to the kernel
+ * directly.
+ */
+template <typename T>
+struct IBDTag {
+    Array4<T> bdry;
+    Array4<T const> crse;
+    Array4<int const> mask;
+    Box bx;
+    int dir;
+
+    [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+    Box const& box () const noexcept { return bx; }
+};
 
 /**
  * \brief An InterpBndryData object adds to a BndryData object the ability to
@@ -118,6 +138,29 @@ public:
      */
     void updateBndryValues (BndryRegisterT<MF>& crse, int c_start, int bnd_start, int num_comp,
                             const IntVect& ratio, int max_order = IBD_max_order_DEF, int max_width = 2);
+
+    /**
+     * \brief Update boundary values at coarse/fine boundaries, batched.
+     *
+     * Equivalent to the overload above, but on GPU issues a single kernel for
+     * every (box, face) strip instead of one per strip.  \p tags is built on
+     * first use and reused thereafter; it holds Array4s into this object and
+     * into \p crse, so the caller owns it and must discard it whenever either
+     * is redefined, and must not reuse it with a different \p crse.  Off GPU
+     * this forwards to the overload above and leaves \p tags untouched.
+     *
+     * \param crse      BndryRegister storing coarse level data
+     * \param c_start   starting component of the coarse data
+     * \param bnd_start starting component in this InterpBndryData
+     * \param num_comp  number of component
+     * \param ratio     refinement ratio
+     * \param tags      caller-owned tag cache
+     * \param max_order interpolation order
+     * \param max_width max width of the interpolation stencil
+     */
+    void updateBndryValues (BndryRegisterT<MF>& crse, int c_start, int bnd_start, int num_comp,
+                            const IntVect& ratio, TagVector<IBDTag<value_type>>& tags,
+                            int max_order = IBD_max_order_DEF, int max_width = 2);
 
     //! Set boundary values to zero
     void setHomogValues ();
@@ -287,6 +330,87 @@ InterpBndryDataT<MF>::updateBndryValues (BndryRegisterT<MF>& crse, int c_start, 
 {
     MF foo(this->grids, this->bndry[0].DistributionMap(), 1, num_comp, MFInfo().SetAlloc(false));
     setBndryValues(crse, c_start, foo, 0, bnd_start, num_comp, ratio, max_order, max_width);
+}
+
+template <typename MF>
+void
+InterpBndryDataT<MF>::updateBndryValues (BndryRegisterT<MF>& crse, int c_start, int bnd_start,
+                                         int num_comp, const IntVect& ratio,
+                                         TagVector<IBDTag<value_type>>& tags,
+                                         int max_order, int max_width)
+{
+    if (Gpu::inLaunchRegion() && (max_order == 3 || max_order == 1))
+    {
+        if (max_order == 3) {
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ratio.allLE(4),
+                "InterpBndryDataT<MF>::updateBndryValues: max_order=3 requires refinement ratio <= 4");
+        }
+
+        if (! tags.is_defined()) {
+            const Box& fine_domain = this->geom.Domain();
+            MF foo(this->grids, this->bndry[0].DistributionMap(), 1, num_comp,
+                   MFInfo().SetAlloc(false));
+            Vector<IBDTag<value_type>> tv;
+            tv.reserve(std::size_t(foo.local_size())*2*AMREX_SPACEDIM);
+            for (MFIter mfi(foo); mfi.isValid(); ++mfi)
+            {
+                const Box& fine_bx = mfi.validbox();
+                for (OrientationIter fi; fi; ++fi) {
+                    const Orientation face = fi();
+                    const int dir = face.coordDir();
+                    // Coarse/fine faces only.  The physical-boundary branch of
+                    // the unbatched path reads the fine MF, which this entry
+                    // point does not have.
+                    if (fine_bx[face] != fine_domain[face] || this->geom.isPeriodic(dir))
+                    {
+                        tv.push_back(IBDTag<value_type>{
+                            this->bndry[face].array(mfi),
+                            crse[face].const_array(mfi),
+                            this->masks[face].const_array(mfi),
+                            this->bndry[face][mfi].box(),
+                            dir});
+                    }
+                }
+            }
+            tags.define(tv);
+        }
+
+        const auto rr = ratio.dim3();
+        const int is_not_covered = BndryData::not_covered;
+        ParallelFor(tags, num_comp,
+        [=] AMREX_GPU_DEVICE (int i, int j, int k, int n,
+                              IBDTag<value_type> const& tag) noexcept
+        {
+            if (max_order == 1) {
+                interpbndrydata_o1(i,j,k,n,tag.bdry,bnd_start,tag.crse,c_start,rr);
+            }
+            else if (tag.dir == 0) {
+                interpbndrydata_x_o3(i,j,k,n,tag.bdry,bnd_start,tag.crse,c_start,rr,
+                                     tag.mask,is_not_covered,max_width);
+            }
+#if (AMREX_SPACEDIM >= 2)
+#if (AMREX_SPACEDIM == 3)
+            else if (tag.dir == 1)
+#else
+            else
+#endif
+            {
+                interpbndrydata_y_o3(i,j,k,n,tag.bdry,bnd_start,tag.crse,c_start,rr,
+                                     tag.mask,is_not_covered,max_width);
+            }
+#if (AMREX_SPACEDIM == 3)
+            else {
+                interpbndrydata_z_o3(i,j,k,n,tag.bdry,bnd_start,tag.crse,c_start,rr,
+                                     tag.mask,is_not_covered,max_width);
+            }
+#endif
+#endif
+        });
+    }
+    else
+    {
+        updateBndryValues(crse, c_start, bnd_start, num_comp, ratio, max_order, max_width);
+    }
 }
 
 template <typename MF>

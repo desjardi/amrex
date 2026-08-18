@@ -631,19 +631,16 @@ YAFluxRegisterT<MF>::Reflux (MF& state, int srccomp, int destcomp, int numcomp)
     //
     if (!m_cfp_mask.empty())
     {
-#ifdef AMREX_USE_OMP
-#pragma omp parallel if (Gpu::notInLaunchRegion())
-#endif
-        for (MFIter mfi(m_cfpatch); mfi.isValid(); ++mfi)
+        // m_cfpatch and m_cfp_mask share a BoxArray and DistributionMapping and
+        // carry no ghost cells, so the MF-scope iteration space is exactly the
+        // per-box fab boxes.
+        auto const& cfp = m_cfpatch.arrays();
+        auto const& msk = m_cfp_mask.const_arrays();
+        amrex::ParallelFor(m_cfpatch, IntVect(0), numcomp,
+        [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k, int n)
         {
-            const Box& bx = m_cfpatch[mfi].box();
-            auto const maskfab = m_cfp_mask.array(mfi);
-            auto       cfptfab = m_cfpatch.array(mfi,srccomp);
-            AMREX_HOST_DEVICE_PARALLEL_FOR_4D ( bx, numcomp, i, j, k, n,
-            {
-                cfptfab(i,j,k,n) *= maskfab(i,j,k);
-            });
-        }
+            cfp[bno](i,j,k,srccomp+n) *= msk[bno](i,j,k);
+        });
     }
 
     m_crse_data.ParallelCopy(m_cfpatch, srccomp, srccomp, numcomp,
