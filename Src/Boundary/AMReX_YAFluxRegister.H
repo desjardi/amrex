@@ -170,6 +170,19 @@ public:
     void setDeterministic (bool flag) { m_deterministic = flag; }
     [[nodiscard]] bool getDeterministic () const { return m_deterministic; }
 
+    //! The coarse-side cell-type flags (CellType codes), for an
+    //! operator-side fused flux+add path.
+    [[nodiscard]] iMultiFab const& getCrseFlag () const noexcept { return m_crse_flag; }
+
+    //! For cfpatch local index \p li, the LOCAL index of the fine grid
+    //! that owns the patch: a fused fine-side pass reads that grid's
+    //! solution and coefficients when accumulating into the patch.
+    [[nodiscard]] Vector<int> const& getCfpLocalIndex () const noexcept { return m_cfp_localindex; }
+
+    //! Curvilinear coarse volume if one was supplied (fused paths must
+    //! decline when present).
+    [[nodiscard]] MF const* getCrseVolume () const noexcept { return m_cvol; }
+
 protected:
 
     MF m_crse_data;

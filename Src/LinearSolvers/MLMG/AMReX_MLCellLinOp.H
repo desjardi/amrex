@@ -272,6 +272,20 @@ public:
     void reflux (int crse_amrlev,
                          MF& res, const MF& crse_sol, const MF&,
                          MF&, MF& fine_sol, const MF&) const final;
+
+    /**
+     * \brief Operator-side fused replacement for reflux()'s per-box
+     * FFlux+CrseAdd / FFlux+FineAdd loops.
+     *
+     * Called after the register reset and the fine-level applyBC.  An
+     * operator that fills the register in bulk returns true and the
+     * per-box loops are skipped; the default declines.
+     */
+    virtual bool refluxFused (int /*crse_amrlev*/,
+                              YAFluxRegisterT<MF>& /*fluxreg*/,
+                              const MF& /*crse_sol*/,
+                              const MF& /*fine_sol*/) const
+    { return false; }
     /**
      * \brief Compute face-centered fluxes from the supplied solution.
      *
@@ -1431,6 +1445,38 @@ MLCellLinOpT<MF>::interpolationAmr (int famrlev, MF& fine, const MF& crse,
     const FabArray<EBCellFlagFab>* flags = (factory) ? &(factory->getMultiEBCellFlagFab()) : nullptr;
 #endif
 
+#ifdef AMREX_USE_GPU
+    // One launch for the whole level on the common path (linear cc
+    // interpolation, no EB cut cells, no hidden dimension): each thread
+    // runs the box-looping kernel on its own one-cell box, so the
+    // per-cell arithmetic is exactly the per-box path's.
+    bool fused_ok = Gpu::inLaunchRegion() && !this->hasHiddenDimension()
+                    && (refratio == 2 || refratio == 4);
+#ifdef AMREX_USE_EB
+    fused_ok = fused_ok && (factory == nullptr);
+#endif
+    if (fused_ok) {
+        auto const& fma = fine.arrays();
+        auto const& cma = crse.const_arrays();
+        if (refratio == 2) {
+            ParallelFor(fine, IntVect(0),
+            [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k) noexcept
+            {
+                const Box b(IntVect(AMREX_D_DECL(i,j,k)), IntVect(AMREX_D_DECL(i,j,k)));
+                mlmg_lin_cc_interp_r2(b, fma[bno], cma[bno], ncomp);
+            });
+        } else {
+            ParallelFor(fine, IntVect(0),
+            [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k) noexcept
+            {
+                const Box b(IntVect(AMREX_D_DECL(i,j,k)), IntVect(AMREX_D_DECL(i,j,k)));
+                mlmg_lin_cc_interp_r4(b, fma[bno], cma[bno], ncomp);
+            });
+        }
+        return;
+    }
+#endif
+
     MFItInfo mfi_info;
     if (Gpu::notInLaunchRegion()) { mfi_info.EnableTiling().SetDynamic(true); }
 #ifdef AMREX_USE_OMP
@@ -1648,6 +1694,12 @@ MLCellLinOpT<MF>::reflux (int crse_amrlev, MF& res, const MF& crse_sol, const MF
     const int mglev = 0;
     applyBC(fine_amrlev, mglev, fine_sol, BCMode::Inhomogeneous, StateMode::Solution,
             m_bndry_sol[fine_amrlev].get());
+
+    if (this->refluxFused(crse_amrlev, fluxreg, crse_sol, fine_sol)) {
+        fluxreg.Reflux(res);
+        this->applyOverset(crse_amrlev, res);
+        return;
+    }
 
     MFItInfo mfi_info;
     if (Gpu::notInLaunchRegion()) { mfi_info.EnableTiling().SetDynamic(true); }

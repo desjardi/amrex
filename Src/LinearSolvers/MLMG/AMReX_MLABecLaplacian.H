@@ -14,6 +14,20 @@ namespace amrex {
  * templated on the MultiFab-like container in use.
  */
 
+//! One coarse/fine-patch strip of the fused reflux fine side: the box in
+//! coarse index space, the destination patch and owning fine grid by
+//! LOCAL index (arrays are fetched per call, never cached), and the
+//! direction/side code yafluxreg_fineadd uses.
+struct MLABecFusedCFTag {
+    Box bx;
+    int cfp;
+    int fine;
+    int dirside;
+
+    [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+    Box const& box () const noexcept { return bx; }
+};
+
 /// \ingroup amrex_solver_mlmg
 /// (alpha * a - beta * (del dot b grad)) phi
 template <typename MF>
@@ -199,6 +213,15 @@ public:
                 const Array<FAB*,AMREX_SPACEDIM>& flux,
                 const FAB& sol, Location /* loc */,
                 int face_only=0) const override;
+
+    /**
+     * \brief Fill the coarse/fine flux register in bulk: one flag-guarded
+     * launch on the coarse side and one tagged launch over the register's
+     * patches on the fine side, with the FFlux stencil evaluated inline.
+     * Values and per-cell summation order match the per-box path exactly.
+     */
+    bool refluxFused (int crse_amrlev, YAFluxRegisterT<MF>& fluxreg,
+                      const MF& crse_sol, const MF& fine_sol) const override;
 
     //! Divide \p mf by the diagonal of the operator (used by CG-family bottom solvers).
     void normalize (int amrlev, int mglev, MF& mf) const override;
@@ -1229,6 +1252,257 @@ MLABecLaplacianT<MF>::FFlux (int amrlev, const MFIter& mfi,
                                                          &(m_b_coeffs[amrlev][mglev][1][mfi]),
                                                          &(m_b_coeffs[amrlev][mglev][2][mfi]))}},
           flux, sol, face_only, ncomp);
+}
+
+template <typename MF>
+bool
+MLABecLaplacianT<MF>::refluxFused (int crse_amrlev, YAFluxRegisterT<MF>& fluxreg,
+                                   const MF& crse_sol, const MF& fine_sol) const
+{
+#if defined(AMREX_USE_GPU) && (AMREX_SPACEDIM == 3)
+    if (!Gpu::inLaunchRegion()) { return false; }
+    if (fluxreg.getCrseVolume() != nullptr) { return false; }
+
+    const int nc = this->getNComp();
+    const int fine_amrlev = crse_amrlev+1;
+    const int mglev = 0;
+    const RT bscalar = m_b_scalar;
+
+    // ---- coarse side: one flag-guarded launch over the register's own
+    // layout (defined on the coarse level's grids, so bno aligns with the
+    // solution and the coefficients); the FFlux value is evaluated inline
+    // and consumed in yafluxreg_crseadd's exact term order ----
+    {
+        const Real* cdxinv = this->m_geom[crse_amrlev][mglev].InvCellSize();
+        const Real* cdx    = this->m_geom[crse_amrlev][mglev].CellSize();
+        const RT facx = bscalar*static_cast<RT>(cdxinv[0]);
+        const RT facy = bscalar*static_cast<RT>(cdxinv[1]);
+        const RT facz = bscalar*static_cast<RT>(cdxinv[2]);
+        const RT dtdx = static_cast<RT>(Real(1.0)/cdx[0]);
+        const RT dtdy = static_cast<RT>(Real(1.0)/cdx[1]);
+        const RT dtdz = static_cast<RT>(Real(1.0)/cdx[2]);
+        auto const& dma  = fluxreg.getCrseData().arrays();
+        auto const& flg  = fluxreg.getCrseFlag().const_arrays();
+        auto const& sma  = crse_sol.const_arrays();
+        auto const& bxma = m_b_coeffs[crse_amrlev][mglev][0].const_arrays();
+        auto const& byma = m_b_coeffs[crse_amrlev][mglev][1].const_arrays();
+        auto const& bzma = m_b_coeffs[crse_amrlev][mglev][2].const_arrays();
+        constexpr int cfb = YAFluxRegisterT<MF>::crse_fine_boundary_cell;
+        constexpr int fcl = YAFluxRegisterT<MF>::fine_cell;
+        ParallelFor(fluxreg.getCrseData(), IntVect(0),
+        [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k) noexcept
+        {
+            if (flg[bno](i,j,k) == cfb) {
+                auto const& d = dma[bno];
+                auto const& s = sma[bno];
+                if (flg[bno](i-1,j,k) == fcl) {
+                    for (int n = 0; n < nc; ++n) {
+                        const RT f = -facx*bxma[bno](i,j,k,n)*(s(i,j,k,n)-s(i-1,j,k,n));
+                        d(i,j,k,n) -= dtdx*f;
+                    }
+                }
+                if (flg[bno](i+1,j,k) == fcl) {
+                    for (int n = 0; n < nc; ++n) {
+                        const RT f = -facx*bxma[bno](i+1,j,k,n)*(s(i+1,j,k,n)-s(i,j,k,n));
+                        d(i,j,k,n) += dtdx*f;
+                    }
+                }
+                if (flg[bno](i,j-1,k) == fcl) {
+                    for (int n = 0; n < nc; ++n) {
+                        const RT f = -facy*byma[bno](i,j,k,n)*(s(i,j,k,n)-s(i,j-1,k,n));
+                        d(i,j,k,n) -= dtdy*f;
+                    }
+                }
+                if (flg[bno](i,j+1,k) == fcl) {
+                    for (int n = 0; n < nc; ++n) {
+                        const RT f = -facy*byma[bno](i,j+1,k,n)*(s(i,j+1,k,n)-s(i,j,k,n));
+                        d(i,j,k,n) += dtdy*f;
+                    }
+                }
+                if (flg[bno](i,j,k-1) == fcl) {
+                    for (int n = 0; n < nc; ++n) {
+                        const RT f = -facz*bzma[bno](i,j,k,n)*(s(i,j,k,n)-s(i,j,k-1,n));
+                        d(i,j,k,n) -= dtdz*f;
+                    }
+                }
+                if (flg[bno](i,j,k+1) == fcl) {
+                    for (int n = 0; n < nc; ++n) {
+                        const RT f = -facz*bzma[bno](i,j,k+1,n)*(s(i,j,k+1,n)-s(i,j,k,n));
+                        d(i,j,k,n) += dtdz*f;
+                    }
+                }
+            }
+        });
+    }
+
+    // ---- fine side: tags over the register's cfp strips (built fresh
+    // per call: boxes and local indices only, no cached pointers); each
+    // strip cell is written by exactly one thread, which walks its fine
+    // faces in yafluxreg_fineadd's loop order with the face_only FFlux
+    // value inlined, so the accumulation is deterministic and matches the
+    // per-box path to the bit ----
+    {
+        const IntVect ratio{this->AMRRefRatioVect(crse_amrlev)};
+        const Dim3 rr = ratio.dim3();
+        const Real* fdxinv = this->m_geom[fine_amrlev][mglev].InvCellSize();
+        const Real* fdx    = this->m_geom[fine_amrlev][mglev].CellSize();
+        const RT ratio_t = static_cast<RT>(ratio[0]*ratio[1]*ratio[2]);
+        const Real dt = Real(1.0);
+        const RT dtdx0 = static_cast<RT>(dt/(fdx[0]*ratio_t));
+        const RT dtdx1 = static_cast<RT>(dt/(fdx[1]*ratio_t));
+        const RT dtdx2 = static_cast<RT>(dt/(fdx[2]*ratio_t));
+        const RT facf0 = bscalar*static_cast<RT>(fdxinv[0]);
+        const RT facf1 = bscalar*static_cast<RT>(fdxinv[1]);
+        const RT facf2 = bscalar*static_cast<RT>(fdxinv[2]);
+
+        MF& cfp = fluxreg.getFineData();
+        Vector<int> const& cfpmap = fluxreg.getCfpLocalIndex();
+        Vector<int> const& findex = fine_sol.IndexArray();
+        BoxArray const& fba = fine_sol.boxArray();
+
+        Vector<MLABecFusedCFTag> tags;
+        for (MFIter mfi(cfp); mfi.isValid(); ++mfi) {
+            const int li   = mfi.LocalIndex();
+            const int flgi = cfpmap[li];
+            const Box cbx  = amrex::coarsen(fba[findex[flgi]], ratio);
+            const Box& pbx = mfi.validbox();
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                const Box& lobx_is = amrex::adjCellLo(cbx, idim) & pbx;
+                if (lobx_is.ok()) {
+                    tags.push_back(MLABecFusedCFTag{lobx_is, li, flgi, idim*2});
+                }
+                const Box& hibx_is = amrex::adjCellHi(cbx, idim) & pbx;
+                if (hibx_is.ok()) {
+                    tags.push_back(MLABecFusedCFTag{hibx_is, li, flgi, idim*2+1});
+                }
+            }
+        }
+
+        if (!tags.empty()) {
+            auto const& cma  = cfp.arrays();
+            auto const& sma  = fine_sol.const_arrays();
+            auto const& bxma = m_b_coeffs[fine_amrlev][mglev][0].const_arrays();
+            auto const& byma = m_b_coeffs[fine_amrlev][mglev][1].const_arrays();
+            auto const& bzma = m_b_coeffs[fine_amrlev][mglev][2].const_arrays();
+            TagVector<MLABecFusedCFTag> tv;
+            tv.define(tags);
+            ParallelFor(tv,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k,
+                                  MLABecFusedCFTag const& tag) noexcept
+            {
+                auto const& d = cma[tag.cfp];
+                auto const& s = sma[tag.fine];
+                switch (tag.dirside) {
+                case 0 :
+                {
+                    const int ii = (i+1)*rr.x;
+                    for (int n = 0; n < nc; ++n) {
+                        RT* AMREX_RESTRICT dp = &(d(i,j,k,n));
+                        for (int koff = 0; koff < rr.z; ++koff) {
+                            const int kk = k*rr.z + koff;
+                            for (int joff = 0; joff < rr.y; ++joff) {
+                                const int jj = j*rr.y + joff;
+                                const RT f = -facf0*bxma[tag.fine](ii,jj,kk,n)
+                                             *(s(ii,jj,kk,n)-s(ii-1,jj,kk,n));
+                                *dp += -dtdx0*f;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 1 :
+                {
+                    const int ii = i*rr.x;
+                    for (int n = 0; n < nc; ++n) {
+                        RT* AMREX_RESTRICT dp = &(d(i,j,k,n));
+                        for (int koff = 0; koff < rr.z; ++koff) {
+                            const int kk = k*rr.z + koff;
+                            for (int joff = 0; joff < rr.y; ++joff) {
+                                const int jj = j*rr.y + joff;
+                                const RT f = -facf0*bxma[tag.fine](ii,jj,kk,n)
+                                             *(s(ii,jj,kk,n)-s(ii-1,jj,kk,n));
+                                *dp += dtdx0*f;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 2 :
+                {
+                    const int jj = (j+1)*rr.y;
+                    for (int n = 0; n < nc; ++n) {
+                        RT* AMREX_RESTRICT dp = &(d(i,j,k,n));
+                        for (int koff = 0; koff < rr.z; ++koff) {
+                            const int kk = k*rr.z + koff;
+                            for (int ioff = 0; ioff < rr.x; ++ioff) {
+                                const int ii = i*rr.x + ioff;
+                                const RT f = -facf1*byma[tag.fine](ii,jj,kk,n)
+                                             *(s(ii,jj,kk,n)-s(ii,jj-1,kk,n));
+                                *dp += -dtdx1*f;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 3 :
+                {
+                    const int jj = j*rr.y;
+                    for (int n = 0; n < nc; ++n) {
+                        RT* AMREX_RESTRICT dp = &(d(i,j,k,n));
+                        for (int koff = 0; koff < rr.z; ++koff) {
+                            const int kk = k*rr.z + koff;
+                            for (int ioff = 0; ioff < rr.x; ++ioff) {
+                                const int ii = i*rr.x + ioff;
+                                const RT f = -facf1*byma[tag.fine](ii,jj,kk,n)
+                                             *(s(ii,jj,kk,n)-s(ii,jj-1,kk,n));
+                                *dp += dtdx1*f;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 4 :
+                {
+                    const int kk = (k+1)*rr.z;
+                    for (int n = 0; n < nc; ++n) {
+                        RT* AMREX_RESTRICT dp = &(d(i,j,k,n));
+                        for (int joff = 0; joff < rr.y; ++joff) {
+                            const int jj = j*rr.y + joff;
+                            for (int ioff = 0; ioff < rr.x; ++ioff) {
+                                const int ii = i*rr.x + ioff;
+                                const RT f = -facf2*bzma[tag.fine](ii,jj,kk,n)
+                                             *(s(ii,jj,kk,n)-s(ii,jj,kk-1,n));
+                                *dp += -dtdx2*f;
+                            }
+                        }
+                    }
+                    break;
+                }
+                default:
+                {
+                    const int kk = k*rr.z;
+                    for (int n = 0; n < nc; ++n) {
+                        RT* AMREX_RESTRICT dp = &(d(i,j,k,n));
+                        for (int joff = 0; joff < rr.y; ++joff) {
+                            const int jj = j*rr.y + joff;
+                            for (int ioff = 0; ioff < rr.x; ++ioff) {
+                                const int ii = i*rr.x + ioff;
+                                const RT f = -facf2*bzma[tag.fine](ii,jj,kk,n)
+                                             *(s(ii,jj,kk,n)-s(ii,jj,kk-1,n));
+                                *dp += dtdx2*f;
+                            }
+                        }
+                    }
+                }
+                }
+            });
+        }
+    }
+    return true;
+#else
+    amrex::ignore_unused(crse_amrlev, fluxreg, crse_sol, fine_sol);
+    return false;
+#endif
 }
 
 template <typename MF>
