@@ -285,6 +285,27 @@ struct TagVector {
 #endif
     }
 
+    //! Release the buffers once the work queued on the stream is done,
+    //! without waiting for it
+    void release_async () {
+        if (defined) {
+#ifdef AMREX_USE_GPU
+            if (h_buffer) { Gpu::freeAsync(The_Pinned_Arena(), h_buffer); }
+            if (d_buffer) { Gpu::freeAsync(The_Arena(), d_buffer); }
+#else
+            if (h_buffer) { The_Pinned_Arena()->free(h_buffer); }
+#endif
+            h_buffer = nullptr;
+            d_buffer = nullptr;
+            d_tags = nullptr;
+            d_nwarps = nullptr;
+            ntags = 0;
+            ntotwarps = 0;
+            nblocks = 0;
+            defined = false;
+        }
+    }
+
     void undefine () {
         if (defined) {
             Gpu::streamSynchronize();

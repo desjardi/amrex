@@ -8,6 +8,8 @@
 #include <AMReX_LO_BCTYPES.H>
 #include <AMReX_Orientation.H>
 #include <AMReX_Utility.H>
+#include <AMReX_TagParallelFor.H>
+#include <memory>
 #include <utility>
 
 /**
@@ -111,6 +113,9 @@ public:
     //! Set all boundary FABs to the scalar value \p v across every component.
     void setVal (value_type v);
 
+    //! setVal in one launch over every face's fabs (cached tags; FabSet::setVal launches per box)
+    void setValFused (value_type v);
+
     //! Accumulate another register with identical layout into this one.
     BndryRegisterT<MF>& operator+= (const BndryRegisterT<MF>& rhs);
 
@@ -171,6 +176,13 @@ protected:
     //! The data.
     FabSetT<MF> bndry[2*AMREX_SPACEDIM];
     BoxArray    grids;
+
+    //! One FabArray over every face's boxes, its fabs aliasing the face
+    //! FabSets' storage: copyFrom then makes one ParallelCopy, not one per face
+    std::unique_ptr<MF> m_fused;
+    void makeFused ();
+    //! Every face's local fabs, for setValFused
+    std::unique_ptr<TagVector<Array4BoxTag<value_type>>> m_setval_tags;
 };
 
 template <typename MF>
@@ -206,6 +218,8 @@ template <typename MF>
 void
 BndryRegisterT<MF>::clear ()
 {
+    m_fused.reset();
+    m_setval_tags.reset();
     for (auto & i : bndry) {
         i.clear();
     }
@@ -220,6 +234,8 @@ BndryRegisterT<MF>::define (Orientation _face, IndexType _typ, int _in_rad,
 {
     BoxArray fsBA(grids, BATransformer(_face,_typ,_in_rad,_out_rad,_extent_rad));
 
+    m_fused.reset();
+    m_setval_tags.reset();
     FabSetT<MF>& fabs = bndry[_face];
 
     AMREX_ASSERT(fabs.size() == 0);
@@ -306,19 +322,67 @@ BndryRegisterT<MF>::linComb (value_type a, const MF& mfa, int a_comp,
 }
 
 template <typename MF>
+void
+BndryRegisterT<MF>::setValFused (value_type v)
+{
+    if (!m_setval_tags) {
+        Vector<Array4BoxTag<value_type>> tags;
+        for (OrientationIter face; face; ++face) {
+            MF& mf = bndry[face()].multiFab();
+            for (MFIter mfi(mf); mfi.isValid(); ++mfi) {
+                tags.push_back(Array4BoxTag<value_type>{mf.array(mfi), mf[mfi].box()});
+            }
+        }
+        m_setval_tags = std::make_unique<TagVector<Array4BoxTag<value_type>>>(tags);
+    }
+    const int ncomp = bndry[0].nComp();
+    ParallelFor(*m_setval_tags, ncomp,
+    [=] AMREX_GPU_DEVICE (int i, int j, int k, int n, Array4BoxTag<value_type> const& tag) noexcept
+    {
+        tag.dfab(i,j,k,n) = v;
+    });
+}
+
+template <typename MF>
+void
+BndryRegisterT<MF>::makeFused ()
+{
+    const int N = bndry[0].size();
+    const int ncomp = bndry[0].nComp();
+    BoxList bl;
+    bl.reserve(std::size_t(N)*2*AMREX_SPACEDIM);
+    Vector<int> pmap;
+    pmap.reserve(std::size_t(N)*2*AMREX_SPACEDIM);
+    for (OrientationIter face; face; ++face) {
+        const BoxArray& ba = bndry[face()].boxArray();
+        const auto& pm = bndry[face()].DistributionMap().ProcessorMap();
+        for (int i = 0; i < N; ++i) {
+            bl.push_back(ba[i]);
+            pmap.push_back(pm[i]);
+        }
+    }
+    BoxArray ba6(std::move(bl));
+    DistributionMapping dm6(std::move(pmap));
+    m_fused = std::make_unique<MF>(ba6, dm6, ncomp, 0, MFInfo().SetAlloc(false));
+    int f = 0;
+    for (OrientationIter face; face; ++face, ++f) {
+        MF& mf = bndry[face()].multiFab();
+        for (MFIter mfi(mf); mfi.isValid(); ++mfi) {
+            auto& fab = mf[mfi];
+            m_fused->setFab(f*N + mfi.index(),
+                            typename MF::fab_type(fab.box(), ncomp, fab.dataPtr()));
+        }
+    }
+}
+
+template <typename MF>
 BndryRegisterT<MF>&
 BndryRegisterT<MF>::copyFrom (const MF& src, int nghost,
                               int src_comp, int dest_comp, int num_comp,
                               const Periodicity& period)
 {
-    for (OrientationIter face; face; ++face) {
-        bndry[face()].multiFab().ParallelCopy_nowait(src,src_comp,dest_comp,num_comp,
-                                                     nghost,0,period);
-    }
-
-    for (OrientationIter face; face; ++face) {
-        bndry[face()].multiFab().ParallelCopy_finish();
-    }
+    if (!m_fused) { makeFused(); }
+    m_fused->ParallelCopy(src, src_comp, dest_comp, num_comp, nghost, 0, period);
     return *this;
 }
 

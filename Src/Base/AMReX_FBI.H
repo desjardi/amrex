@@ -84,6 +84,29 @@ fab_to_fab (Vector<Array4CopyTag<T0, T1> > const& copy_tags, int scomp, int dcom
     });
 }
 
+//! fab_to_fab without the closing stream synchronization: the tag buffers are
+//! released asynchronously, so the caller must own no temporary the kernel reads
+template <class T0, class T1, class F>
+void
+fab_to_fab_async (Vector<Array4CopyTag<T0, T1> > const& copy_tags, int scomp, int dcomp,
+                  int ncomp, F && f)
+{
+    TagVector<Array4CopyTag<T0, T1>> tv{copy_tags};
+
+    detail::ParallelFor_doit(tv,
+        [=] AMREX_GPU_DEVICE (
+            int icell, int ncells, int i, int j, int k, Array4CopyTag<T0, T1> const& tag) noexcept
+    {
+        if (icell < ncells) {
+            for (int n = 0; n < ncomp; ++n) {
+                f(&(tag.dfab(i,j,k,n+dcomp)),
+                  tag.sfab(i+tag.offset.x,j+tag.offset.y,k+tag.offset.z,n+scomp));
+            }
+        }
+    });
+    tv.release_async();
+}
+
 template <class TagType, class F>
 void
 fab_to_fab_store (Vector<TagType> const& tags, int scomp, int dcomp, int ncomp, F&&f)
@@ -1313,7 +1336,8 @@ FabArray<FAB>::unpack_recv_buffer_gpu (FabArray<FAB>& dst, int dcomp, int ncomp,
                     (pbuffer, *tv, dcomp, ncomp);
             }
         }
-        Gpu::streamSynchronize();
+        // single-stream no-sync region: the caller frees the receive buffer asynchronously
+        if (!(Gpu::inNoSyncRegion() && Gpu::inSingleStreamRegion())) { Gpu::streamSynchronize(); }
     }
     else
     {

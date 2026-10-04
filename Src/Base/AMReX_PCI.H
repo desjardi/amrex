@@ -149,7 +149,10 @@ FabArray<FAB>::PC_local_gpu (const CPC& thecpc, FabArray<FAB> const& src,
 
     if (op == FabArrayBase::COPY)
     {
-        if (is_thread_safe) {
+        if (is_thread_safe && (Gpu::inNoSyncRegion() && Gpu::inSingleStreamRegion())) {
+            detail::fab_to_fab_async<value_type, value_type>(loc_copy_tags, scomp,
+                dcomp, ncomp, detail::CellStore<value_type, value_type>());
+        } else if (is_thread_safe) {
             detail::fab_to_fab<value_type, value_type>(loc_copy_tags, scomp,
                 dcomp, ncomp, detail::CellStore<value_type, value_type>());
         } else {
@@ -162,8 +165,13 @@ FabArray<FAB>::PC_local_gpu (const CPC& thecpc, FabArray<FAB> const& src,
         if (is_thread_safe) {
             // Non-overlapping destinations: a plain add is already bitwise
             // reproducible, so no need for the heavier deterministic kernel.
-            detail::fab_to_fab<value_type, value_type>(loc_copy_tags, scomp,
-                dcomp, ncomp, detail::CellAdd<value_type, value_type>());
+            if ((Gpu::inNoSyncRegion() && Gpu::inSingleStreamRegion())) {
+                detail::fab_to_fab_async<value_type, value_type>(loc_copy_tags, scomp,
+                    dcomp, ncomp, detail::CellAdd<value_type, value_type>());
+            } else {
+                detail::fab_to_fab<value_type, value_type>(loc_copy_tags, scomp,
+                    dcomp, ncomp, detail::CellAdd<value_type, value_type>());
+            }
         } else if (deterministic) {
             // Use deterministic_fab_to_fab for ADD operations to ensure bitwise
             // reproducibility. The atomic add operations (fab_to_fab_atomic_add) are

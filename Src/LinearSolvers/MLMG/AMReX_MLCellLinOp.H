@@ -115,6 +115,10 @@ public:
      * \param crse_bcdata Coarse BC MultiFab copied into the cache.
      */
     void updateSolBC (int amrlev, const MF& crse_bcdata) const;
+
+    //! updateSolBC of a zero coarse solution, with no communication
+    void zeroSolBC (int amrlev) const override;
+    [[nodiscard]] bool zeroSolBCSupported () const override { return true; }
     /**
      * \brief Refresh stored correction BC data from coarse inputs.
      *
@@ -997,6 +1001,22 @@ MLCellLinOpT<MF>::updateSolBC (int amrlev, const MF& crse_bcdata) const
 
 template <typename MF>
 void
+MLCellLinOpT<MF>::zeroSolBC (int amrlev) const
+{
+    BL_PROFILE("MLCellLinOp::zeroSolBC()");
+
+    AMREX_ALWAYS_ASSERT(amrlev > 0);
+    const int ncomp = this->getNComp();
+    m_crse_sol_br[amrlev]->setValFused(RT(0.0));
+    m_bndry_sol[amrlev]->updateBndryValues(*m_crse_sol_br[amrlev], 0, 0, ncomp,
+                                           this->AMRRefRatioVect(amrlev-1),
+                                           m_sol_bc_tags[amrlev],
+                                           InterpBndryDataT<MF>::IBD_max_order_DEF,
+                                           m_interpbndry_halfwidth);
+}
+
+template <typename MF>
+void
 MLCellLinOpT<MF>::updateCorBC (int amrlev, const MF& crse_bcdata) const
 {
     BL_PROFILE("MLCellLinOp::updateCorBC()");
@@ -1700,8 +1720,10 @@ MLCellLinOpT<MF>::reflux (int crse_amrlev, MF& res, const MF& crse_sol, const MF
     const Real* fine_dx = this->m_geom[fine_amrlev][0].CellSize();
 
     const int mglev = 0;
-    applyBC(fine_amrlev, mglev, fine_sol, BCMode::Inhomogeneous, StateMode::Solution,
-            m_bndry_sol[fine_amrlev].get());
+    if (!this->m_reflux_fine_bc_current) {
+        applyBC(fine_amrlev, mglev, fine_sol, BCMode::Inhomogeneous, StateMode::Solution,
+                m_bndry_sol[fine_amrlev].get());
+    }
 
     if (this->refluxFused(crse_amrlev, fluxreg, crse_sol, fine_sol)) {
         fluxreg.Reflux(res);

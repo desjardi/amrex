@@ -470,6 +470,14 @@ public:
     virtual void solutionResidual (int amrlev, MF& resid, MF& x, const MF& b,
                                    const MF* crse_bcdata=nullptr) = 0;
 
+    //! Set the coarse/fine solution boundary values of AMR level amrlev to
+    //! those of a zero coarse solution, without communication
+    virtual void zeroSolBC (int amrlev) const {
+        amrex::ignore_unused(amrlev);
+        amrex::Abort("MLLinOpT::zeroSolBC: not implemented");
+    }
+    [[nodiscard]] virtual bool zeroSolBCSupported () const { return false; }
+
     /**
      * \brief Ensure BC caches are populated before flux extraction.
      *
@@ -938,6 +946,11 @@ protected:
     MF m_coarse_data_for_bc_raii;
 
     bool m_precond_mode = false;
+public:
+    //! Set by MLMG around a reflux whose fine solution had its boundary
+    //! applied by the solutionResidual just before it
+    mutable bool m_reflux_fine_bc_current = false;
+protected:
 
     //! Return AMR refinement ratios
     [[nodiscard]] const Vector<int>& AMRRefRatio () const noexcept { return m_amr_ref_ratio; }

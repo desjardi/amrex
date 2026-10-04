@@ -294,6 +294,15 @@ public:
     void setPrecondIter (int nit) noexcept { max_precond_iters = nit; }
 
     /**
+     * \brief Preconditioner fast path. Contract: every precond() call enters
+     * with a zero initial guess (valid and ghost cells) and its return value
+     * is not used. The entry residual is then the rhs, the coarse/fine
+     * solution boundary values of the first V-cycle's down sweep are zero,
+     * and the convergence norms of a fixed-iteration solve are skipped.
+     */
+    void setPrecondFast (bool flag) noexcept { precond_fast = flag; }
+
+    /**
      * \brief Number of pre-smoothing passes per V-cycle.
      *
      * \param n Pre-smoothing iterations.
@@ -663,6 +672,8 @@ private:
     int max_iters = 200;
     int do_fixed_number_of_iters = 0;
     int max_precond_iters = 1;
+    bool precond_fast = false;
+    bool m_zero_crse_sol = false; //!< down sweep of a zero-guess first V-cycle
 
     int nu1 = 2;       //!< pre
     int nu2 = 2;       //!< post
@@ -861,12 +872,21 @@ MLMGT<MF>::solve (const Vector<AMF*>& a_sol, const Vector<AMF const*>& a_rhs,
 
     prepareForSolve(a_sol, a_rhs);
 
-    computeMLResidual(finest_amr_lev);
+    // Zero guess: the residual is the rhs, and every coarse/fine solution
+    // boundary value is that of a zero coarse solution
+    const bool fast = precond_mode && precond_fast && do_fixed_number_of_iters > 0
+        && linop.zeroSolBCSupported();
+    if (fast) {
+        for (int alev = 1; alev <= finest_amr_lev; ++alev) { linop.zeroSolBC(alev); }
+        LocalCopy(res[finest_amr_lev][0], rhs[finest_amr_lev], 0, 0, ncomp, IntVect(0));
+    } else {
+        computeMLResidual(finest_amr_lev);
+    }
 
     bool local = true;
-    RT resnorm0 = MLResNormInf(finest_amr_lev, local);
-    RT rhsnorm0 = MLRhsNormInf(local);
-    if (!is_nsolve) {
+    RT resnorm0 = fast ? RT(0.0) : MLResNormInf(finest_amr_lev, local);
+    RT rhsnorm0 = fast ? RT(0.0) : MLRhsNormInf(local);
+    if (!is_nsolve && !fast) {
         ParallelAllReduce::Max<RT>({resnorm0, rhsnorm0}, ParallelContext::CommunicatorSub());
 
         if (verbose >= 1)
@@ -903,7 +923,7 @@ MLMGT<MF>::solve (const Vector<AMF*>& a_sol, const Vector<AMF const*>& a_rhs,
 
     const RT res_target = std::max(a_tol_abs, std::max(a_tol_rel,RT(1.e-16))*max_norm);
 
-    if (!is_nsolve && resnorm0 <= res_target) {
+    if (!is_nsolve && !fast && resnorm0 <= res_target) {
         composite_norminf = resnorm0;
         if (verbose >= 1) {
             amrex::Print() << print_ident << "MLMG: No iterations needed\n";
@@ -915,9 +935,18 @@ MLMGT<MF>::solve (const Vector<AMF*>& a_sol, const Vector<AMF const*>& a_rhs,
         const int niters = do_fixed_number_of_iters ? do_fixed_number_of_iters : max_iters;
         for (int iter = 0; iter < niters; ++iter)
         {
+            m_zero_crse_sol = fast && (iter == 0);
             oneIter(iter);
+            m_zero_crse_sol = false;
 
             converged = false;
+
+            // The next V-cycle's residual; a fixed-iteration fast solve
+            // neither needs the last one nor tests convergence
+            if (fast) {
+                if (iter+1 < niters) { computeResidual(finest_amr_lev); }
+                continue;
+            }
 
             // Test convergence on the fine amr level
             computeResidual(finest_amr_lev);
@@ -1337,8 +1366,10 @@ MLMGT<MF>::compResidual (const Vector<MF*>& a_res, const Vector<MF*>& a_sol,
 #endif
         linop.solutionResidual(alev, *a_res[alev], sol[alev], *prhs, crse_bcdata);
         if (alev < finest_amr_lev) {
+            linop.m_reflux_fine_bc_current = true;
             linop.reflux(alev, *a_res[alev], sol[alev], *prhs,
                          *a_res[alev+1], sol[alev+1], *a_rhs[alev+1]);
+            linop.m_reflux_fine_bc_current = false;
             if (linop.isCellCentered()) {
 #ifdef AMREX_USE_EB
                 EB_average_down(*a_res[alev+1], *a_res[alev], 0, ncomp, linop.AMRRefRatioVect(alev));
@@ -1406,8 +1437,10 @@ MLMGT<MF>::apply (const Vector<MF*>& out, const Vector<MF*>& a_in)
         const MF* crse_bcdata = (alev > 0) ? in[alev-1] : nullptr;
         linop.solutionResidual(alev, *out[alev], *in[alev], rh[alev], crse_bcdata);
         if (alev < finest_amr_lev) {
+            linop.m_reflux_fine_bc_current = true;
             linop.reflux(alev, *out[alev], *in[alev], rh[alev],
                          *out[alev+1], *in[alev+1], rh[alev+1]);
+            linop.m_reflux_fine_bc_current = false;
             if (linop.isCellCentered()) {
                 if constexpr (IsMultiFabLike_v<MF>) {
 #ifdef AMREX_USE_EB
@@ -1543,9 +1576,16 @@ MLMGT<MF>::prepareForSolve (Vector<AMF*> const& a_sol, Vector<AMF const*> const&
 #endif
     }
 
+    const bool fast = precond_mode && precond_fast && do_fixed_number_of_iters > 0
+        && linop.zeroSolBCSupported();
     for (int falev = finest_amr_lev; falev > 0; --falev)
     {
-        linop.averageDownSolutionRHS(falev-1, sol[falev-1], rhs[falev-1], sol[falev], rhs[falev]);
+        if (fast) {
+            // the zero guess averages down to itself
+            amrex::average_down(rhs[falev], rhs[falev-1], 0, ncomp, linop.AMRRefRatioVect(falev-1));
+        } else {
+            linop.averageDownSolutionRHS(falev-1, sol[falev-1], rhs[falev-1], sol[falev], rhs[falev]);
+        }
     }
 
     // enforce solvability if appropriate
@@ -2139,8 +2179,10 @@ MLMGT<MF>::computeMLResidual (int amrlevmax)
         const MF* crse_bcdata = (alev > 0) ? &(sol[alev-1]) : nullptr;
         linop.solutionResidual(alev, res[alev][mglev], sol[alev], rhs[alev], crse_bcdata);
         if (alev < finest_amr_lev) {
+            linop.m_reflux_fine_bc_current = true;
             linop.reflux(alev, res[alev][mglev], sol[alev], rhs[alev],
                          res[alev+1][mglev], sol[alev+1], rhs[alev+1]);
+            linop.m_reflux_fine_bc_current = false;
         }
     }
 }
@@ -2177,7 +2219,9 @@ MLMGT<MF>::computeResWithCrseSolFineCor (int calev, int falev)
     MF&       fine_res = res[falev][0];
     MF&    fine_rescor = rescor[falev][0];
 
-    const MF* crse_bcdata = (calev > 0) ? &(sol[calev-1]) : nullptr;
+    // In the zero-guess down sweep sol[calev-1] is still zero and its
+    // boundary values were set at entry
+    const MF* crse_bcdata = (calev > 0 && !m_zero_crse_sol) ? &(sol[calev-1]) : nullptr;
     linop.solutionResidual(calev, crse_res, crse_sol, crse_rhs, crse_bcdata);
 
     linop.correctionResidual(falev, 0, fine_rescor, fine_cor, fine_res, BCMode::Homogeneous);

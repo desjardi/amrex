@@ -300,7 +300,11 @@ FabArray<FAB>::FillBoundary_finish ()
 
         if (fbd->the_recv_data)
         {
-            amrex::The_Comms_Arena()->free(fbd->the_recv_data);
+            if ((Gpu::inNoSyncRegion() && Gpu::inSingleStreamRegion())) {
+                Gpu::freeAsync(amrex::The_Comms_Arena(), fbd->the_recv_data);
+            } else {
+                amrex::The_Comms_Arena()->free(fbd->the_recv_data);
+            }
             fbd->the_recv_data = nullptr;
         }
     }
@@ -743,7 +747,11 @@ FabArray<FAB>::ParallelCopy_finish ()
 
         if (pcd->the_recv_data)
         {
-            amrex::The_Comms_Arena()->free(pcd->the_recv_data);
+            if ((Gpu::inNoSyncRegion() && Gpu::inSingleStreamRegion())) {
+                Gpu::freeAsync(amrex::The_Comms_Arena(), pcd->the_recv_data);
+            } else {
+                amrex::The_Comms_Arena()->free(pcd->the_recv_data);
+            }
             pcd->the_recv_data = nullptr;
         }
     }
