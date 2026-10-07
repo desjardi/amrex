@@ -529,18 +529,10 @@ Arena::Initialize (bool minimal)
 
 #ifdef AMREX_USE_GPU
     if (ParallelDescriptor::UseGpuAwareMpi()) {
-        if (!(the_arena->isDevice()) &&
-            the_device_arena_defragmentation == the_comms_arena_defragmentation)
-        {
-            the_comms_arena = the_device_arena;
-        } else {
-            ArenaInfo ai{};
-            ai.SetDeviceMemory();
-            ai.SetReleaseThreshold(the_comms_arena_release_threshold);
-            ai.SetDefragmentation(the_comms_arena_defragmentation);
-            the_comms_arena = new CArena(0, ai);
-            the_comms_arena->registerForProfiling("Comms Memory");
-        }
+        // With GPU-aware MPI the comms arena is the device arena, so every
+        // device buffer MPI reads comes from the arena that holds the run's
+        // data, not from a separate pool whose chunks come and go
+        the_comms_arena = the_device_arena;
     } else {
         the_comms_arena = the_pinned_arena;
     }

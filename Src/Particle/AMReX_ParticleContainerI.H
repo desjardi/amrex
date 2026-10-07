@@ -1463,6 +1463,14 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
 
     for (int lev = 0; lev < theEffectiveFinestLevel+1; ++lev) { RedefineDummyMF(lev); }
 
+    // Tiles, emptied or not, and the held working storage stay from one call
+    // to the next while the layouts stand; a layout change drops both
+    const bool layout_changed = redistLayoutChanged();
+    if (layout_changed) {
+        m_redist_op.clear();
+        m_redist_plan.clear();
+    }
+
     int finest_lev_particles;
     if (lev_max == -1) {
         lev_max = theEffectiveFinestLevel;
@@ -1490,7 +1498,8 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
 #endif
 
     BL_PROFILE_VAR_START(blp_partition);
-    ParticleCopyOp op;
+    ParticleCopyOp& op = m_redist_op;
+    op.resetSizes();
     int num_levels = finest_lev_particles + 1;
     op.setNumLevels(num_levels);
     Vector<std::map<std::pair<int, int>, int> > new_sizes(num_levels);
@@ -1598,7 +1607,8 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
                                                 std::forward<CellAssignor>(CellAssignor{}),
                                                 BufferMap(),
                                                 plo, phi, rlo, rhi, is_per, lev, gid, tid,
-                                                lev_min, lev_max, nGrow, remove_negative);
+                                                lev_min, lev_max, nGrow, remove_negative,
+                                                m_redist_part);
 
         int num_move = np - num_stay;
         *new_size_ptrs[pmap_it] = num_stay;
@@ -1667,19 +1677,27 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
 #endif
     BL_PROFILE_VAR_STOP(blp_partition);
 
-    ParticleCopyPlan plan;
+    ParticleCopyPlan& plan = m_redist_plan;
+    plan.reset();
 
     plan.build(*this, op, h_redistribute_int_comp,
                h_redistribute_real_comp, local, max_cells_moved);
 
-    // by default, this uses The_Arena();
-    amrex::PODVector<char, PolymorphicArenaAllocator<char> > snd_buffer;
-    amrex::PODVector<char, PolymorphicArenaAllocator<char> > rcv_buffer;
-
-    if (use_comms_arena) {
-        snd_buffer.setArena(The_Comms_Arena());
-        rcv_buffer.setArena(The_Comms_Arena());
+    // by default, this uses The_Arena(). Held across calls: their sizes start
+    // at zero so a growth never copies stale bytes, and their storage stays
+    auto& snd_buffer = m_redist_snd;
+    auto& rcv_buffer = m_redist_rcv;
+    Arena* const comm_ar = use_comms_arena ? The_Comms_Arena() : The_Arena();
+    if (snd_buffer.arena() != comm_ar) {
+        snd_buffer.free_async();
+        snd_buffer.setArena(comm_ar);
     }
+    if (rcv_buffer.arena() != comm_ar) {
+        rcv_buffer.free_async();
+        rcv_buffer.setArena(comm_ar);
+    }
+    snd_buffer.resize(0);
+    rcv_buffer.resize(0);
 
     packBuffer(*this, op, plan, snd_buffer);
 
@@ -1697,9 +1715,11 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
         }
     }
 
-    for (int lev = lev_min; lev <= lev_max; lev++)
-    {
-        particle_detail::clearEmptyEntries(m_particles[lev]);
+    if (layout_changed) {
+        for (int lev = lev_min; lev <= lev_max; lev++)
+        {
+            particle_detail::clearEmptyEntries(m_particles[lev]);
+        }
     }
 
     if (std::ssize(m_particles) > theEffectiveFinestLevel+1) {
@@ -1725,8 +1745,10 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
     else
     {
         Gpu::Device::streamSynchronize();
-        Gpu::PinnedVector<char> pinned_snd_buffer;
-        Gpu::PinnedVector<char> pinned_rcv_buffer;
+        auto& pinned_snd_buffer = m_redist_psnd;
+        auto& pinned_rcv_buffer = m_redist_prcv;
+        pinned_snd_buffer.resize(0);
+        pinned_rcv_buffer.resize(0);
 
         if (snd_buffer.arena()->isPinned()) {
             plan.buildMPIFinish(BufferMap());
@@ -1751,6 +1773,35 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
 
     Gpu::Device::streamSynchronize();
     AMREX_ASSERT(numParticlesOutOfRange(*this, lev_min, lev_max, nGrow) == 0);
+}
+
+template <typename ParticleType, int NArrayReal, int NArrayInt,
+          template<class> class Allocator, class CellAssignor>
+bool
+ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssignor>
+::redistLayoutChanged ()
+{
+    const int nlev = static_cast<int>(m_particles.size());
+    bool changed = (static_cast<int>(m_redist_ba.size()) != nlev);
+    m_redist_ba.resize(nlev);
+    m_redist_dm.resize(nlev);
+    for (int lev = 0; lev < nlev; ++lev) {
+        if (!m_gdb->LevelDefined(lev)) {
+            changed = changed || !m_redist_ba[lev].empty();
+            m_redist_ba[lev] = BoxArray();
+            m_redist_dm[lev] = DistributionMapping();
+            continue;
+        }
+        const BoxArray& ba = ParticleBoxArray(lev);
+        const DistributionMapping& dm = ParticleDistributionMap(lev);
+        if (!BoxArray::SameRefs(ba, m_redist_ba[lev]) ||
+            !DistributionMapping::SameRefs(dm, m_redist_dm[lev])) {
+            changed = true;
+            m_redist_ba[lev] = ba;
+            m_redist_dm[lev] = dm;
+        }
+    }
+    return changed;
 }
 
 template <typename ParticleType, int NArrayReal, int NArrayInt,

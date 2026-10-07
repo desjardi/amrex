@@ -1612,6 +1612,24 @@ private:
     int num_real_comm_comps, num_int_comm_comps;
     Vector<ParticleLevel> m_particles;
 
+    //! Redistribute's working storage, held across calls and grown only, so
+    //! a call between layout changes allocates nothing: the copy op and plan,
+    //! the partition scratch, the message buffers MPI reads and writes and
+    //! their pinned mirrors, and the layouts the held tiles were checked on
+    ParticleCopyOp m_redist_op;
+    ParticleCopyPlan m_redist_plan;
+    PartitionScratch m_redist_part;
+    amrex::PODVector<char, PolymorphicArenaAllocator<char> > m_redist_snd;
+    amrex::PODVector<char, PolymorphicArenaAllocator<char> > m_redist_rcv;
+    Gpu::PinnedVector<char> m_redist_psnd;
+    Gpu::PinnedVector<char> m_redist_prcv;
+    Vector<BoxArray> m_redist_ba;
+    Vector<DistributionMapping> m_redist_dm;
+
+    //! True when some level's layout is not the one the last call saw;
+    //! records the current ones
+    bool redistLayoutChanged ();
+
     // names of both compile-time and runtime Real and Int SoA data
     std::vector<std::string> m_soa_rdata_names;
     std::vector<std::string> m_soa_idata_names;

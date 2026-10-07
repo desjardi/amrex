@@ -15,6 +15,15 @@ void ParticleCopyOp::clear ()
     m_periodic_shift.resize(0);
 }
 
+void ParticleCopyOp::resetSizes ()
+{
+    for (auto& m : m_boxes) { for (auto& kv : m) { kv.second.resize(0); } }
+    for (auto& m : m_levels) { for (auto& kv : m) { kv.second.resize(0); } }
+    for (auto& m : m_tiles) { for (auto& kv : m) { kv.second.resize(0); } }
+    for (auto& m : m_src_indices) { for (auto& kv : m) { kv.second.resize(0); } }
+    for (auto& m : m_periodic_shift) { for (auto& kv : m) { kv.second.resize(0); } }
+}
+
 void ParticleCopyOp::setNumLevels (int num_levels)
 {
     m_boxes.resize(num_levels);
@@ -51,6 +60,44 @@ void ParticleCopyPlan::clear ()
     m_rcv_box_tids.clear();
     m_rcv_box_pids.clear();
     m_rcv_box_levs.clear();
+}
+
+void ParticleCopyPlan::reset ()
+{
+    for (auto& m : m_dst_indices) { for (auto& kv : m) { kv.second.resize(0); } }
+    m_box_counts_d.resize(0);
+    m_box_counts_h.resize(0);
+    m_box_offsets.resize(0);
+    m_rcv_box_counts.resize(0);
+    m_rcv_box_offsets.resize(0);
+    m_rcv_box_ids.resize(0);
+    m_rcv_box_tids.resize(0);
+    m_rcv_box_pids.resize(0);
+    m_rcv_box_levs.resize(0);
+    m_NumSnds = 0;
+    m_nrcvs = 0;
+    m_build_stats.resize(0);
+    m_build_rreqs.resize(0);
+    m_particle_rstats.resize(0);
+    m_particle_rreqs.resize(0);
+    m_particle_sstats.resize(0);
+    m_particle_sreqs.resize(0);
+    m_snd_num_particles.resize(0);
+    m_rcv_num_particles.resize(0);
+    m_neighbor_procs.resize(0);
+    m_Snds.resize(0);
+    m_Rcvs.resize(0);
+    m_RcvProc.resize(0);
+    m_rOffset.resize(0);
+    m_rcv_data.resize(0);
+    m_snd_offsets.resize(0);
+    m_snd_counts.resize(0);
+    m_snd_pad_correction_h.resize(0);
+    m_snd_pad_correction_d.resize(0);
+    m_rcv_pad_correction_h.resize(0);
+    m_rcv_pad_correction_d.resize(0);
+    d_int_comp_mask.resize(0);
+    d_real_comp_mask.resize(0);
 }
 
 void ParticleCopyPlan::buildMPIStart (const ParticleContainerBase& pc, const ParticleBufferMap& map, Long psize) // NOLINT(readability-convert-member-functions-to-static)

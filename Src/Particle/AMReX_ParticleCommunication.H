@@ -74,6 +74,9 @@ struct ParticleCopyOp
 
     void clear ();
 
+    //! Every held entry back to zero copies, its storage kept
+    void resetSizes ();
+
     void setNumLevels (int num_levels);
 
     void resize (int gid, int tid, int lev, int size);
@@ -510,6 +513,10 @@ public:
 
     void clear ();
 
+    //! The state of the last build dropped, its storage kept, so a plan
+    //! held across calls builds the next one without allocating
+    void reset ();
+
     void buildMPIFinish (const ParticleBufferMap& map);
 
 private:
@@ -603,8 +610,13 @@ void packBuffer (const PC& pc, const ParticleCopyOp& op, const ParticleCopyPlan&
         total_buffer_size = plan.m_snd_offsets.back();
     }
 
-    if (! snd_buffer.arena()->hasFreeDeviceMemory(total_buffer_size)) {
-        snd_buffer.clear();
+    // The pinned fallback serves only a buffer that must grow: one whose
+    // capacity already holds the message keeps its storage and its arena.
+    // Called before the messages on snd_buffer are posted and after the
+    // previous ones completed, so an arena change never meets a pending one
+    if (snd_buffer.capacity() < total_buffer_size &&
+        ! snd_buffer.arena()->hasFreeDeviceMemory(total_buffer_size)) {
+        snd_buffer.free_async();
         snd_buffer.setArena(The_Pinned_Arena());
     }
     snd_buffer.resize(total_buffer_size);
