@@ -721,16 +721,16 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
         });
 }
 
+//! The particle count up to which partitionParticlesByDest partitions a tile
+//! in one thread rather than by a scan
+inline constexpr int partition_serial_max = 256;
+
 /**
  * \brief Caller-held scratch of partitionParticlesByDest: the stay flags, the
  * swap index lists and the cells the left count is read back through. It
  * grows and is never shrunk, so a caller that holds it across calls stops
  * allocating once it is large enough.
  */
-//! The particle count up to which partitionParticlesByDest partitions a tile
-//! in one thread rather than by a scan
-inline constexpr int partition_serial_max = 256;
-
 struct PartitionScratch
 {
     Gpu::DeviceVector<uint8_t> stays;

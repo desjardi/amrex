@@ -1755,7 +1755,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
             Gpu::Device::streamSynchronize();
             communicateParticlesStart(*this, plan, snd_buffer, pinned_rcv_buffer);
         } else {
-            pinned_snd_buffer.resize(snd_buffer.size());
+            pinned_snd_buffer.resize(snd_buffer.size(), GrowthStrategy::Geometric);
             Gpu::dtoh_memcpy_async(pinned_snd_buffer.dataPtr(), snd_buffer.dataPtr(), snd_buffer.size());
             plan.buildMPIFinish(BufferMap());
             Gpu::Device::streamSynchronize();
@@ -1764,7 +1764,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
 
         this->ReserveForRedistribute(plan);
 
-        rcv_buffer.resize(pinned_rcv_buffer.size());
+        rcv_buffer.resize(pinned_rcv_buffer.size(), GrowthStrategy::Geometric);
         unpackBuffer(*this, plan, snd_buffer, RedistributeUnpackPolicy());
         communicateParticlesFinish(plan);
         Gpu::htod_memcpy_async(rcv_buffer.dataPtr(), pinned_rcv_buffer.dataPtr(), pinned_rcv_buffer.size());
