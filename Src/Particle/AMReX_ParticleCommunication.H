@@ -74,9 +74,6 @@ struct ParticleCopyOp
 
     void clear ();
 
-    //! Every held entry back to zero copies, its storage kept
-    void resetSizes ();
-
     void setNumLevels (int num_levels);
 
     void resize (int gid, int tid, int lev, int size);
@@ -513,10 +510,6 @@ public:
 
     void clear ();
 
-    //! The state of the last build dropped, its storage kept, so a plan
-    //! held across calls builds the next one without allocating
-    void reset ();
-
     void buildMPIFinish (const ParticleBufferMap& map);
 
 private:
@@ -610,22 +603,11 @@ void packBuffer (const PC& pc, const ParticleCopyOp& op, const ParticleCopyPlan&
         total_buffer_size = plan.m_snd_offsets.back();
     }
 
-    // The pinned fallback serves only a buffer that must grow: one whose
-    // capacity already holds the message keeps its storage and its arena.
-    // A buffer that must grow grows geometrically, and falls back to pinned
-    // memory when the grown capacity does not fit on the device.
-    // Called before the messages on snd_buffer are posted and after the
-    // previous ones completed, so an arena change never meets a pending one
-    if (snd_buffer.capacity() < total_buffer_size) {
-        using value_type = typename Buffer::value_type;
-        std::size_t const grown = grow_podvector_capacity(GrowthStrategy::Geometric,
-            total_buffer_size, snd_buffer.capacity(), sizeof(value_type));
-        if (! snd_buffer.arena()->hasFreeDeviceMemory(grown*sizeof(value_type))) {
-            snd_buffer.free_async();
-            snd_buffer.setArena(The_Pinned_Arena());
-        }
+    if (! snd_buffer.arena()->hasFreeDeviceMemory(total_buffer_size)) {
+        snd_buffer.clear();
+        snd_buffer.setArena(The_Pinned_Arena());
     }
-    snd_buffer.resize(total_buffer_size, GrowthStrategy::Geometric);
+    snd_buffer.resize(total_buffer_size);
 
     const auto* p_comm_real = plan.d_real_comp_mask.dataPtr();
     const auto* p_comm_int  = plan.d_int_comp_mask.dataPtr();
@@ -964,7 +946,7 @@ void communicateParticlesStart (const PC& pc, ParticleCopyPlan& plan, const SndB
     Gpu::copy(Gpu::hostToDevice, plan.m_rcv_pad_correction_h.begin(), plan.m_rcv_pad_correction_h.end(),
               plan.m_rcv_pad_correction_d.begin());
 
-    rcv_buffer.resize(TotRcvBytes, GrowthStrategy::Geometric);
+    rcv_buffer.resize(TotRcvBytes);
 
     plan.m_nrcvs = int(RcvProc.size());
 

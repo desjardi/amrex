@@ -308,8 +308,6 @@ public:
 private:
     Vector<ParticleLocator<Bins> > m_locators;
     Gpu::DeviceVector<AssignGrid<BinIteratorFactory> > m_grid_assignors;
-    //! setGeometry's pinned staging, held across calls
-    Gpu::HostVector<AssignGrid<BinIteratorFactory> > m_h_grid_assignors;
     bool m_defined = false;
 
 public:
@@ -404,8 +402,7 @@ public:
     {
         int num_levels = a_gdb->finestLevel()+1;
 #ifdef AMREX_USE_GPU
-        m_h_grid_assignors.resize(num_levels);
-        auto& h_grid_assignors = m_h_grid_assignors;
+        Gpu::HostVector<AssignGrid<BinIteratorFactory> > h_grid_assignors(num_levels);
         for (int lev = 0; lev < num_levels; ++lev)
         {
             m_locators[lev].setGeometry(a_gdb->Geom(lev));
